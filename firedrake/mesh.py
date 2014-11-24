@@ -118,12 +118,17 @@ class _Facets(object):
                        np.uintc, "%s_%s_local_facet_number" % (self.mesh.name, self.kind))
 
 
-class Mesh(object):
-    """A representation of mesh topology and geometry."""
+class MeshMetaClass(type):
+    """Metaclass to Mesh.
+
+    Defines custom instance creation, such that a QuadrilateralMesh
+    instance is created instead of a Mesh instance when the mesh is
+    quadrilateral.
+    """
 
     @timed_function("Build mesh")
     @profile
-    def __init__(self, meshfile, **kwargs):
+    def __call__(cls, meshfile, **kwargs):
         """Construct a mesh object.
 
         Meshes may either be created by reading from a mesh file, or by
@@ -169,38 +174,47 @@ class Mesh(object):
         reorder = kwargs.get("reorder", parameters["reorder_meshes"])
         periodic_coords = kwargs.get("periodic_coords", None)
 
+        if isinstance(meshfile, PETSc.DMPlex):
+            name = "plexmesh"
+            plex = meshfile
+        else:
+            if periodic_coords is not None:
+                raise RuntimeError("Periodic coordinates are unsupported when reading from file")
+
+            basename, ext = os.path.splitext(meshfile)
+
+            name = meshfile
+            if ext.lower() in ['.e', '.exo']:
+                plex = Mesh._from_exodus(meshfile)
+            elif ext.lower() == '.cgns':
+                plex = Mesh._from_cgns(meshfile)
+            elif ext.lower() == '.msh':
+                plex = Mesh._from_gmsh(meshfile)
+            elif ext.lower() == '.node':
+                plex = Mesh._from_triangle(meshfile, dim)
+            else:
+                raise RuntimeError("Mesh file %s has unknown format '%s'."
+                                   % (meshfile, ext[1:]))
+
+        mesh = object.__new__(Mesh)
+        mesh.__init__(name, plex, dim, reorder, periodic_coords=periodic_coords)
+        return mesh
+
+
+class Mesh(object):
+    """A representation of mesh topology and geometry."""
+
+    __metaclass__ = MeshMetaClass
+
+    def __init__(self, name, plex, geometric_dim,
+                 reorder, periodic_coords=None):
+        """ Create mesh from DMPlex object """
+
+        self.name = name
+
         # A cache of function spaces that have been built on this mesh
         self._cache = {}
         self.parent = None
-
-        if isinstance(meshfile, PETSc.DMPlex):
-            self.name = "plexmesh"
-            self._from_dmplex(meshfile, dim, reorder,
-                              periodic_coords=periodic_coords)
-            return
-
-        basename, ext = os.path.splitext(meshfile)
-
-        if periodic_coords is not None:
-            raise RuntimeError("Periodic coordinates are unsupported when reading from file")
-        self.name = meshfile
-        if ext.lower() in ['.e', '.exo']:
-            plex = Mesh._from_exodus(meshfile)
-        elif ext.lower() == '.cgns':
-            plex = Mesh._from_cgns(meshfile)
-        elif ext.lower() == '.msh':
-            plex = Mesh._from_gmsh(meshfile)
-        elif ext.lower() == '.node':
-            plex = Mesh._from_triangle(meshfile, dim)
-        else:
-            raise RuntimeError("Mesh file %s has unknown format '%s'."
-                               % (meshfile, ext[1:]))
-        self.name = meshfile
-        self._from_dmplex(plex, dim, reorder)
-
-    def _from_dmplex(self, plex, geometric_dim,
-                     reorder, periodic_coords=None):
-        """ Create mesh from DMPlex object """
 
         self._plex = plex
         self.uid = utils._new_uid()
@@ -624,6 +638,13 @@ class QuadrilateralMesh(Mesh):
         return [(0, 1), (1, 0)]
 
 
+class ExtrudedMeshMetaClass(MeshMetaClass):
+    def __call__(cls, *args, **kwargs):
+        mesh = object.__new__(ExtrudedMesh)
+        mesh.__init__(*args, **kwargs)
+        return mesh
+
+
 class ExtrudedMesh(Mesh):
     """Build an extruded mesh from an input mesh
 
@@ -669,6 +690,8 @@ class ExtrudedMesh(Mesh):
 
     For more details see the :doc:`manual section on extruded meshes <extruded-meshes>`.
     """
+
+    __metaclass__ = ExtrudedMeshMetaClass
 
     @timed_function("Build extruded mesh")
     @profile
