@@ -198,15 +198,6 @@ class Mesh(object):
         self.name = meshfile
         self._from_dmplex(plex, dim, reorder)
 
-    @property
-    def coordinates(self):
-        """The :class:`.Function` containing the coordinates of this mesh."""
-        return self._coordinate_function
-
-    @coordinates.setter
-    def coordinates(self, value):
-        self._coordinate_function = value
-
     def _from_dmplex(self, plex, geometric_dim,
                      reorder, periodic_coords=None):
         """ Create mesh from DMPlex object """
@@ -420,6 +411,15 @@ class Mesh(object):
                     plex.setLabelValue("boundary_ids", join[0], bid)
 
         return plex
+
+    @property
+    def coordinates(self):
+        """The :class:`.Function` containing the coordinates of this mesh."""
+        return self._coordinate_function
+
+    @coordinates.setter
+    def coordinates(self, value):
+        self._coordinate_function = value
 
     @utils.cached_property
     def cell_closure(self):
