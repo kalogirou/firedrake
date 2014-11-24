@@ -118,6 +118,15 @@ class _Facets(object):
                        np.uintc, "%s_%s_local_facet_number" % (self.mesh.name, self.kind))
 
 
+def _cellname(plex):
+    topological_dim = plex.getDimension()
+
+    cStart, cEnd = plex.getHeightStratum(0)  # cells
+    cell_facets = plex.getConeSize(cStart)
+
+    return fiat_utils._cells[topological_dim][cell_facets]
+
+
 class MeshMetaClass(type):
     """Metaclass to Mesh.
 
@@ -196,7 +205,11 @@ class MeshMetaClass(type):
                 raise RuntimeError("Mesh file %s has unknown format '%s'."
                                    % (meshfile, ext[1:]))
 
-        mesh = object.__new__(Mesh)
+        if _cellname(plex) == "quadrilateral":
+            MeshClass = QuadrilateralMesh
+        else:
+            MeshClass = Mesh
+        mesh = object.__new__(MeshClass)
         mesh.__init__(name, plex, dim, reorder, periodic_coords=periodic_coords)
         return mesh
 
@@ -226,9 +239,8 @@ class Mesh(object):
         with timed_region("Mesh: label facets"):
             dmplex.label_facets(self._plex)
 
-        topological_dim = plex.getDimension()
         if geometric_dim is None:
-            geometric_dim = topological_dim
+            geometric_dim = plex.getDimension()
 
         # Distribute the dm to all ranks
         if op2.MPI.comm.size > 1:
@@ -250,20 +262,7 @@ class Mesh(object):
             dmplex.mark_entity_classes(self._plex)
             self._plex_renumbering = dmplex.plex_renumbering(self._plex, reordering)
 
-            cStart, cEnd = self._plex.getHeightStratum(0)  # cells
-            cell_facets = self._plex.getConeSize(cStart)
-
-            cellname = fiat_utils._cells[topological_dim][cell_facets]
-            if cellname == "quadrilateral":
-                # HACK ALERT!
-                # One should normally decide the type of an object before its creation,
-                # however, there is too much setup before we realise that we need a
-                # QuadrilateralMesh, so we just change the type here.
-                # A proper solution would require an extensive refactoring
-                # of mesh creation.
-                self.__class__ = QuadrilateralMesh
-
-            self._ufl_cell = ufl.Cell(cellname, geometric_dimension=geometric_dim)
+            self._ufl_cell = ufl.Cell(_cellname(plex), geometric_dimension=geometric_dim)
             self._ufl_domain = ufl.Domain(self.ufl_cell(), data=self)
             dim = self._plex.getDimension()
             self._cells, self.cell_classes = dmplex.get_cells_by_class(self._plex)
