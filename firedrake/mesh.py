@@ -183,17 +183,20 @@ class Mesh(object):
 
         if periodic_coords is not None:
             raise RuntimeError("Periodic coordinates are unsupported when reading from file")
+        self.name = meshfile
         if ext.lower() in ['.e', '.exo']:
-            self._from_exodus(meshfile, dim, reorder)
+            plex = Mesh._from_exodus(meshfile)
         elif ext.lower() == '.cgns':
-            self._from_cgns(meshfile, dim)
+            plex = Mesh._from_cgns(meshfile)
         elif ext.lower() == '.msh':
-            self._from_gmsh(meshfile, dim, reorder)
+            plex = Mesh._from_gmsh(meshfile)
         elif ext.lower() == '.node':
-            self._from_triangle(meshfile, dim, reorder)
+            plex = Mesh._from_triangle(meshfile, dim)
         else:
             raise RuntimeError("Mesh file %s has unknown format '%s'."
                                % (meshfile, ext[1:]))
+        self.name = meshfile
+        self._from_dmplex(plex, dim, reorder)
 
     @property
     def coordinates(self):
@@ -314,9 +317,9 @@ class Mesh(object):
             measure._subdomain_data = self.coordinates
             measure._domain = self.ufl_domain()
 
-    def _from_gmsh(self, filename, dim, reorder):
+    @staticmethod
+    def _from_gmsh(filename):
         """Read a Gmsh .msh file from `filename`"""
-        self.name = filename
 
         # Create a read-only PETSc.Viewer
         gmsh_viewer = PETSc.Viewer().create()
@@ -333,10 +336,10 @@ class Mesh(object):
                 for f in faces:
                     gmsh_plex.setLabelValue("boundary_ids", f, bid)
 
-        self._from_dmplex(gmsh_plex, dim, reorder)
+        return gmsh_plex
 
-    def _from_exodus(self, filename, dim, reorder):
-        self.name = filename
+    @staticmethod
+    def _from_exodus(filename):
         plex = PETSc.DMPlex().createExodusFromFile(filename)
 
         boundary_ids = dmplex.getLabelIdIS("Face Sets").getIndices()
@@ -346,18 +349,18 @@ class Mesh(object):
             for f in faces:
                 plex.setLabelValue("boundary_ids", f, bid)
 
-        self._from_dmplex(plex, dim, reorder)
+        return plex
 
-    def _from_cgns(self, filename, dim, reorder):
-        self.name = filename
+    @staticmethod
+    def _from_cgns(filename):
         plex = PETSc.DMPlex().createCGNSFromFile(filename)
 
         #TODO: Add boundary IDs
-        self._from_dmplex(plex, dim, reorder)
+        return plex
 
-    def _from_triangle(self, filename, dim, reorder):
+    @staticmethod
+    def _from_triangle(filename, dim):
         """Read a set of triangle mesh files from `filename`"""
-        self.name = filename
         basename, ext = os.path.splitext(filename)
 
         if op2.MPI.comm.rank == 0:
@@ -416,7 +419,7 @@ class Mesh(object):
                     join = plex.getJoin(vertices)
                     plex.setLabelValue("boundary_ids", join[0], bid)
 
-        self._from_dmplex(plex, dim, reorder)
+        return plex
 
     @utils.cached_property
     def cell_closure(self):
