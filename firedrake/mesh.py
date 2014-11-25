@@ -205,6 +205,10 @@ class MeshMetaClass(type):
                 raise RuntimeError("Mesh file %s has unknown format '%s'."
                                    % (meshfile, ext[1:]))
 
+        # Distribute the dm to all ranks
+        if op2.MPI.comm.size > 1:
+            plex.distribute(overlap=1)
+
         if _cellname(plex) == "quadrilateral":
             MeshClass = QuadrilateralMesh
         else:
@@ -241,10 +245,6 @@ class Mesh(object):
 
         if geometric_dim is None:
             geometric_dim = plex.getDimension()
-
-        # Distribute the dm to all ranks
-        if op2.MPI.comm.size > 1:
-            self.parallel_sf = plex.distribute(overlap=1)
 
         self._plex = plex
 
