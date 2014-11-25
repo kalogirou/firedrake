@@ -127,101 +127,193 @@ def _cellname(plex):
     return fiat_utils._cells[topological_dim][cell_facets]
 
 
-class MeshMetaClass(type):
-    """Metaclass to Mesh.
+@timed_function("Build mesh")
+@profile
+def Mesh(meshfile, **kwargs):
+    """Construct a mesh object.
 
-    Defines custom instance creation, such that a QuadrilateralMesh
-    instance is created instead of a Mesh instance when the mesh is
-    quadrilateral.
+    Meshes may either be created by reading from a mesh file, or by
+    providing a PETSc DMPlex object defining the mesh topology.
+
+    :param meshfile: Mesh file name (or DMPlex object) defining
+           mesh topology.  See below for details on supported mesh
+           formats.
+    :param dim: optional specification of the geometric dimension
+           of the mesh (ignored if not reading from mesh file).
+           If not supplied the geometric dimension is deduced from
+           the topological dimension of entities in the mesh.
+    :param reorder: optional flag indicating whether to reorder
+           meshes for better cache locality.  If not supplied the
+           default value in :data:`parameters["reorder_meshes"]`
+           is used.
+    :param periodic_coords: optional numpy array of coordinates
+           used to replace those in the mesh object.  These are
+           only supported in 1D and must have enough entries to be
+           used as a DG1 field on the mesh.  Not supported when
+           reading from file.
+
+    When the mesh is read from a file the following mesh formats
+    are supported (determined, case insensitively, from the
+    filename extension):
+
+    * GMSH: with extension `.msh`
+    * Exodus: with extension `.e`, `.exo`
+    * CGNS: with extension `.cgns`
+    * Triangle: with extension `.node`
+
+    .. note::
+
+        When the mesh is created directly from a DMPlex object,
+        the :data:`dim` parameter is ignored (the DMPlex already
+        knows its geometric and topological dimensions).
+
     """
 
-    @timed_function("Build mesh")
-    @profile
-    def __call__(cls, meshfile, **kwargs):
-        """Construct a mesh object.
+    utils._init()
 
-        Meshes may either be created by reading from a mesh file, or by
-        providing a PETSc DMPlex object defining the mesh topology.
+    dim = kwargs.get("dim", None)
+    reorder = kwargs.get("reorder", parameters["reorder_meshes"])
+    periodic_coords = kwargs.get("periodic_coords", None)
 
-        :param meshfile: Mesh file name (or DMPlex object) defining
-               mesh topology.  See below for details on supported mesh
-               formats.
-        :param dim: optional specification of the geometric dimension
-               of the mesh (ignored if not reading from mesh file).
-               If not supplied the geometric dimension is deduced from
-               the topological dimension of entities in the mesh.
-        :param reorder: optional flag indicating whether to reorder
-               meshes for better cache locality.  If not supplied the
-               default value in :data:`parameters["reorder_meshes"]`
-               is used.
-        :param periodic_coords: optional numpy array of coordinates
-               used to replace those in the mesh object.  These are
-               only supported in 1D and must have enough entries to be
-               used as a DG1 field on the mesh.  Not supported when
-               reading from file.
+    if isinstance(meshfile, PETSc.DMPlex):
+        name = "plexmesh"
+        plex = meshfile
+    else:
+        if periodic_coords is not None:
+            raise RuntimeError("Periodic coordinates are unsupported when reading from file")
 
-        When the mesh is read from a file the following mesh formats
-        are supported (determined, case insensitively, from the
-        filename extension):
+        basename, ext = os.path.splitext(meshfile)
 
-        * GMSH: with extension `.msh`
-        * Exodus: with extension `.e`, `.exo`
-        * CGNS: with extension `.cgns`
-        * Triangle: with extension `.node`
-
-        .. note::
-
-            When the mesh is created directly from a DMPlex object,
-            the :data:`dim` parameter is ignored (the DMPlex already
-            knows its geometric and topological dimensions).
-
-        """
-
-        utils._init()
-
-        dim = kwargs.get("dim", None)
-        reorder = kwargs.get("reorder", parameters["reorder_meshes"])
-        periodic_coords = kwargs.get("periodic_coords", None)
-
-        if isinstance(meshfile, PETSc.DMPlex):
-            name = "plexmesh"
-            plex = meshfile
+        name = meshfile
+        if ext.lower() in ['.e', '.exo']:
+            plex = _from_exodus(meshfile)
+        elif ext.lower() == '.cgns':
+            plex = _from_cgns(meshfile)
+        elif ext.lower() == '.msh':
+            plex = _from_gmsh(meshfile)
+        elif ext.lower() == '.node':
+            plex = _from_triangle(meshfile, dim)
         else:
-            if periodic_coords is not None:
-                raise RuntimeError("Periodic coordinates are unsupported when reading from file")
+            raise RuntimeError("Mesh file %s has unknown format '%s'."
+                               % (meshfile, ext[1:]))
 
-            basename, ext = os.path.splitext(meshfile)
+    # Distribute the dm to all ranks
+    if op2.MPI.comm.size > 1:
+        plex.distribute(overlap=1)
 
-            name = meshfile
-            if ext.lower() in ['.e', '.exo']:
-                plex = Mesh._from_exodus(meshfile)
-            elif ext.lower() == '.cgns':
-                plex = Mesh._from_cgns(meshfile)
-            elif ext.lower() == '.msh':
-                plex = Mesh._from_gmsh(meshfile)
-            elif ext.lower() == '.node':
-                plex = Mesh._from_triangle(meshfile, dim)
-            else:
-                raise RuntimeError("Mesh file %s has unknown format '%s'."
-                                   % (meshfile, ext[1:]))
-
-        # Distribute the dm to all ranks
-        if op2.MPI.comm.size > 1:
-            plex.distribute(overlap=1)
-
-        if _cellname(plex) == "quadrilateral":
-            MeshClass = QuadrilateralMesh
-        else:
-            MeshClass = Mesh
-        mesh = object.__new__(MeshClass)
-        mesh.__init__(name, plex, dim, reorder, periodic_coords=periodic_coords)
-        return mesh
+    if _cellname(plex) == "quadrilateral":
+        MeshClass = QuadrilateralMesh
+    else:
+        MeshClass = SimplexMesh
+    return MeshClass(name, plex, dim, reorder, periodic_coords=periodic_coords)
 
 
-class Mesh(object):
+def _from_gmsh(filename):
+    """Read a Gmsh .msh file from `filename`"""
+
+    # Create a read-only PETSc.Viewer
+    gmsh_viewer = PETSc.Viewer().create()
+    gmsh_viewer.setType("ascii")
+    gmsh_viewer.setFileMode("r")
+    gmsh_viewer.setFileName(filename)
+    gmsh_plex = PETSc.DMPlex().createGmsh(gmsh_viewer)
+
+    if gmsh_plex.hasLabel("Face Sets"):
+        boundary_ids = gmsh_plex.getLabelIdIS("Face Sets").getIndices()
+        gmsh_plex.createLabel("boundary_ids")
+        for bid in boundary_ids:
+            faces = gmsh_plex.getStratumIS("Face Sets", bid).getIndices()
+            for f in faces:
+                gmsh_plex.setLabelValue("boundary_ids", f, bid)
+
+    return gmsh_plex
+
+
+def _from_exodus(filename):
+    plex = PETSc.DMPlex().createExodusFromFile(filename)
+
+    boundary_ids = dmplex.getLabelIdIS("Face Sets").getIndices()
+    plex.createLabel("boundary_ids")
+    for bid in boundary_ids:
+        faces = plex.getStratumIS("Face Sets", bid).getIndices()
+        for f in faces:
+            plex.setLabelValue("boundary_ids", f, bid)
+
+    return plex
+
+
+def _from_cgns(filename):
+    plex = PETSc.DMPlex().createCGNSFromFile(filename)
+
+    #TODO: Add boundary IDs
+    return plex
+
+
+def _from_triangle(filename, dim):
+    """Read a set of triangle mesh files from `filename`"""
+    basename, ext = os.path.splitext(filename)
+
+    if op2.MPI.comm.rank == 0:
+        try:
+            facetfile = open(basename+".face")
+            tdim = 3
+        except:
+            try:
+                facetfile = open(basename+".edge")
+                tdim = 2
+            except:
+                facetfile = None
+                tdim = 1
+        if dim is None:
+            dim = tdim
+        op2.MPI.comm.bcast(tdim, root=0)
+
+        with open(basename+".node") as nodefile:
+            header = np.fromfile(nodefile, dtype=np.int32, count=2, sep=' ')
+            nodecount = header[0]
+            nodedim = header[1]
+            assert nodedim == dim
+            coordinates = np.loadtxt(nodefile, usecols=range(1, dim+1), skiprows=1, delimiter=' ')
+            assert nodecount == coordinates.shape[0]
+
+        with open(basename+".ele") as elefile:
+            header = np.fromfile(elefile, dtype=np.int32, count=2, sep=' ')
+            elecount = header[0]
+            eledim = header[1]
+            eles = np.loadtxt(elefile, usecols=range(1, eledim+1), dtype=np.int32, skiprows=1, delimiter=' ')
+            assert elecount == eles.shape[0]
+
+        cells = map(lambda c: c-1, eles)
+    else:
+        tdim = op2.MPI.comm.bcast(None, root=0)
+        cells = None
+        coordinates = None
+    plex = utility_meshes._from_cell_list(tdim, cells, coordinates, comm=op2.MPI.comm)
+
+    # Apply boundary IDs
+    if op2.MPI.comm.rank == 0:
+        facets = None
+        try:
+            header = np.fromfile(facetfile, dtype=np.int32, count=2, sep=' ')
+            edgecount = header[0]
+            facets = np.loadtxt(facetfile, usecols=range(1, tdim+2), dtype=np.int32, skiprows=0, delimiter=' ')
+            assert edgecount == facets.shape[0]
+        finally:
+            facetfile.close()
+
+        if facets is not None:
+            vStart, vEnd = plex.getDepthStratum(0)   # vertices
+            for facet in facets:
+                bid = facet[-1]
+                vertices = map(lambda v: v + vStart - 1, facet[:-1])
+                join = plex.getJoin(vertices)
+                plex.setLabelValue("boundary_ids", join[0], bid)
+
+    return plex
+
+
+class MeshBase(object):
     """A representation of mesh topology and geometry."""
-
-    __metaclass__ = MeshMetaClass
 
     def __init__(self, name, plex, geometric_dim,
                  reorder, periodic_coords=None):
@@ -321,110 +413,6 @@ class Mesh(object):
             measure._subdomain_data = self.coordinates
             measure._domain = self.ufl_domain()
 
-    @staticmethod
-    def _from_gmsh(filename):
-        """Read a Gmsh .msh file from `filename`"""
-
-        # Create a read-only PETSc.Viewer
-        gmsh_viewer = PETSc.Viewer().create()
-        gmsh_viewer.setType("ascii")
-        gmsh_viewer.setFileMode("r")
-        gmsh_viewer.setFileName(filename)
-        gmsh_plex = PETSc.DMPlex().createGmsh(gmsh_viewer)
-
-        if gmsh_plex.hasLabel("Face Sets"):
-            boundary_ids = gmsh_plex.getLabelIdIS("Face Sets").getIndices()
-            gmsh_plex.createLabel("boundary_ids")
-            for bid in boundary_ids:
-                faces = gmsh_plex.getStratumIS("Face Sets", bid).getIndices()
-                for f in faces:
-                    gmsh_plex.setLabelValue("boundary_ids", f, bid)
-
-        return gmsh_plex
-
-    @staticmethod
-    def _from_exodus(filename):
-        plex = PETSc.DMPlex().createExodusFromFile(filename)
-
-        boundary_ids = dmplex.getLabelIdIS("Face Sets").getIndices()
-        plex.createLabel("boundary_ids")
-        for bid in boundary_ids:
-            faces = plex.getStratumIS("Face Sets", bid).getIndices()
-            for f in faces:
-                plex.setLabelValue("boundary_ids", f, bid)
-
-        return plex
-
-    @staticmethod
-    def _from_cgns(filename):
-        plex = PETSc.DMPlex().createCGNSFromFile(filename)
-
-        #TODO: Add boundary IDs
-        return plex
-
-    @staticmethod
-    def _from_triangle(filename, dim):
-        """Read a set of triangle mesh files from `filename`"""
-        basename, ext = os.path.splitext(filename)
-
-        if op2.MPI.comm.rank == 0:
-            try:
-                facetfile = open(basename+".face")
-                tdim = 3
-            except:
-                try:
-                    facetfile = open(basename+".edge")
-                    tdim = 2
-                except:
-                    facetfile = None
-                    tdim = 1
-            if dim is None:
-                dim = tdim
-            op2.MPI.comm.bcast(tdim, root=0)
-
-            with open(basename+".node") as nodefile:
-                header = np.fromfile(nodefile, dtype=np.int32, count=2, sep=' ')
-                nodecount = header[0]
-                nodedim = header[1]
-                assert nodedim == dim
-                coordinates = np.loadtxt(nodefile, usecols=range(1, dim+1), skiprows=1, delimiter=' ')
-                assert nodecount == coordinates.shape[0]
-
-            with open(basename+".ele") as elefile:
-                header = np.fromfile(elefile, dtype=np.int32, count=2, sep=' ')
-                elecount = header[0]
-                eledim = header[1]
-                eles = np.loadtxt(elefile, usecols=range(1, eledim+1), dtype=np.int32, skiprows=1, delimiter=' ')
-                assert elecount == eles.shape[0]
-
-            cells = map(lambda c: c-1, eles)
-        else:
-            tdim = op2.MPI.comm.bcast(None, root=0)
-            cells = None
-            coordinates = None
-        plex = utility_meshes._from_cell_list(tdim, cells, coordinates, comm=op2.MPI.comm)
-
-        # Apply boundary IDs
-        if op2.MPI.comm.rank == 0:
-            facets = None
-            try:
-                header = np.fromfile(facetfile, dtype=np.int32, count=2, sep=' ')
-                edgecount = header[0]
-                facets = np.loadtxt(facetfile, usecols=range(1, tdim+2), dtype=np.int32, skiprows=0, delimiter=' ')
-                assert edgecount == facets.shape[0]
-            finally:
-                facetfile.close()
-
-            if facets is not None:
-                vStart, vEnd = plex.getDepthStratum(0)   # vertices
-                for facet in facets:
-                    bid = facet[-1]
-                    vertices = map(lambda v: v + vStart - 1, facet[:-1])
-                    join = plex.getJoin(vertices)
-                    plex.setLabelValue("boundary_ids", join[0], bid)
-
-        return plex
-
     @property
     def coordinates(self):
         """The :class:`.Function` containing the coordinates of this mesh."""
@@ -433,37 +421,6 @@ class Mesh(object):
     @coordinates.setter
     def coordinates(self, value):
         self._coordinate_function = value
-
-    @utils.cached_property
-    def cell_closure(self):
-        """2D array of ordered cell closures
-
-        Each row contains ordered cell entities for a cell, one row per cell.
-        """
-        dm = self._plex
-
-        a_cell = dm.getHeightStratum(0)[0]
-        a_closure = dm.getTransitiveClosure(a_cell)[0]
-        topological_dimension = dm.getDimension()
-
-        entity_per_cell = np.zeros(topological_dimension + 1, dtype=np.int32)
-        for dim in xrange(topological_dimension + 1):
-            start, end = dm.getDepthStratum(dim)
-            entity_per_cell[dim] = sum(map(lambda idx: start <= idx < end, a_closure))
-
-        return dmplex.closure_ordering(dm, dm.getDefaultGlobalSection(),
-                                       self._cell_numbering, entity_per_cell)
-
-    def create_cell_node_list(self, global_numbering, fiat_element, dofs_per_cell):
-        """Builds the DoF mapping.
-
-        :arg global_numbering: Section describing the global DoF numbering
-        :arg fiat_element: The FIAT element for the cell
-        :arg dofs_per_cell: Number of DoFs associated with each mesh cell
-        """
-        return dmplex.get_cell_nodes(global_numbering,
-                                     self.cell_closure,
-                                     dofs_per_cell)
 
     @property
     def layers(self):
@@ -587,11 +544,6 @@ class Mesh(object):
     def size(self, d):
         return self.num_entities(d)
 
-    def facet_dimensions(self):
-        """Returns a singleton list containing the facet dimension."""
-        # Facets have co-dimension 1
-        return [self.ufl_cell().topological_dimension() - 1]
-
     @utils.cached_property
     def cell_set(self):
         size = self.cell_classes
@@ -599,7 +551,45 @@ class Mesh(object):
             op2.Set(size, "%s_cells" % self.name)
 
 
-class QuadrilateralMesh(Mesh):
+class SimplexMesh(MeshBase):
+    @utils.cached_property
+    def cell_closure(self):
+        """2D array of ordered cell closures
+
+        Each row contains ordered cell entities for a cell, one row per cell.
+        """
+        dm = self._plex
+
+        a_cell = dm.getHeightStratum(0)[0]
+        a_closure = dm.getTransitiveClosure(a_cell)[0]
+        topological_dimension = dm.getDimension()
+
+        entity_per_cell = np.zeros(topological_dimension + 1, dtype=np.int32)
+        for dim in xrange(topological_dimension + 1):
+            start, end = dm.getDepthStratum(dim)
+            entity_per_cell[dim] = sum(map(lambda idx: start <= idx < end, a_closure))
+
+        return dmplex.closure_ordering(dm, dm.getDefaultGlobalSection(),
+                                       self._cell_numbering, entity_per_cell)
+
+    def create_cell_node_list(self, global_numbering, fiat_element, dofs_per_cell):
+        """Builds the DoF mapping.
+
+        :arg global_numbering: Section describing the global DoF numbering
+        :arg fiat_element: The FIAT element for the cell
+        :arg dofs_per_cell: Number of DoFs associated with each mesh cell
+        """
+        return dmplex.get_cell_nodes(global_numbering,
+                                     self.cell_closure,
+                                     dofs_per_cell)
+
+    def facet_dimensions(self):
+        """Returns a singleton list containing the facet dimension."""
+        # Facets have co-dimension 1
+        return [self.ufl_cell().topological_dimension() - 1]
+
+
+class QuadrilateralMesh(MeshBase):
     """A mesh class providing functionality specific to quadrilateral meshes.
 
     Not part of the public API.
@@ -637,14 +627,7 @@ class QuadrilateralMesh(Mesh):
         return [(0, 1), (1, 0)]
 
 
-class ExtrudedMeshMetaClass(MeshMetaClass):
-    def __call__(cls, *args, **kwargs):
-        mesh = object.__new__(ExtrudedMesh)
-        mesh.__init__(*args, **kwargs)
-        return mesh
-
-
-class ExtrudedMesh(Mesh):
+class ExtrudedMesh(MeshBase):
     """Build an extruded mesh from an input mesh
 
     :arg mesh:           the unstructured base mesh
@@ -689,8 +672,6 @@ class ExtrudedMesh(Mesh):
 
     For more details see the :doc:`manual section on extruded meshes <extruded-meshes>`.
     """
-
-    __metaclass__ = ExtrudedMeshMetaClass
 
     @timed_function("Build extruded mesh")
     @profile
